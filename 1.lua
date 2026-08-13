@@ -16,6 +16,30 @@ local framework = loadstring(request({
     Method = "Get"
 }).Body)()({debug = false})
 
+-- ═══════════════════════════════════════════════════════════════
+-- MOBILE FIX: GUI inset компенсация
+-- На мобиле Roblox рендерит Drawing поверх ViewportPoint-координат,
+-- но сам ViewportPoint НЕ учитывает верхнюю панель (GuiInset).
+-- Поэтому все Drawing-элементы смещаются вниз на inset.Y пикселей.
+-- ═══════════════════════════════════════════════════════════════
+local GuiService = game:GetService("GuiService")
+local _insetTop = 0
+local function _updateInset()
+    local topLeft, _ = GuiService:GetGuiInset()
+    _insetTop = topLeft.Y or 0
+end
+_updateInset()
+-- обновляем каждые 5 секунд (топбар может грузиться с задержкой)
+task.spawn(function()
+    while true do
+        task.wait(5)
+        _updateInset()
+    end
+end)
+
+-- ═══════════════════════════════════════════════════════════════
+-- ESP SETTINGS
+-- ═══════════════════════════════════════════════════════════════
 local esp = {}
 esp.settings = {
     enabled   = false,
@@ -66,274 +90,356 @@ function esp:getPlayerWeapon(player)
 end
 
 -- ═══════════════════════════════════════════════════════════════
--- DRAWINGS
+-- DRAWING HELPERS
+-- Используем только Square + Line + Text — они работают на всех
+-- мобильных инжекторах (Delta, Arceus X). Quad не всегда есть.
 -- ═══════════════════════════════════════════════════════════════
-local function _newText(color, size)
-    local t = Drawing.new("Text")
-    t.Color = color; t.Size = size; t.Center = true
-    t.Outline = false; t.Visible = false; t.Text = ""
-    return t
+local function _newSquare(filled, color, thickness)
+    local s = Drawing.new("Square")
+    s.Visible   = false
+    s.Filled    = filled or false
+    s.Color     = color or Color3.fromRGB(255,255,255)
+    s.Thickness = thickness or 1
+    s.Transparency = 1
+    return s
 end
-local function _newLine(color, thick)
+
+local function _newLine(color, thickness)
     local l = Drawing.new("Line")
-    l.Color = color; l.Thickness = thick or 1.5; l.Visible = false
+    l.Visible   = false
+    l.Color     = color or Color3.fromRGB(255,255,255)
+    l.Thickness = thickness or 1
+    l.Transparency = 1
     return l
 end
-local function _newQuad(filled, color, thick)
-    local q = Drawing.new("Quad")
-    q.Filled = filled; q.Color = color
-    if not filled then q.Thickness = thick or 1.5 end
-    q.Visible = false
-    return q
+
+local function _newText(color, size)
+    local t = Drawing.new("Text")
+    t.Visible      = false
+    t.Color        = color or Color3.fromRGB(255,255,255)
+    t.Size         = size or 13
+    t.Center       = true
+    t.Outline      = true
+    t.OutlineColor = Color3.fromRGB(0,0,0)
+    t.Text         = ""
+    t.Transparency = 1
+    return t
 end
 
-local _espDrawings = {}
-
+-- ═══════════════════════════════════════════════════════════════
+-- DRAWING POOL
+-- ═══════════════════════════════════════════════════════════════
 local function _espInit(player)
-    if not player or player == esp.localPlayer then return end
-    if _espDrawings[player] then
-        for _, d in pairs(_espDrawings[player]) do
-            if type(d) == "table" then for _, l in pairs(d) do pcall(function() l:Remove() end) end
-            else pcall(function() d:Remove() end) end
+    local d = {}
+    -- Name / Distance / Weapon
+    d.name     = _newText(Color3.fromRGB(255,255,255), 13)
+    d.distance = _newText(Color3.fromRGB(255,255,255), 13)
+    d.weapon   = _newText(Color3.fromRGB(255,0,0), 12)
+
+    -- Full box (Square = 4 стороны)
+    d.full_box         = _newSquare(false, Color3.fromRGB(255,255,255), 1)
+    d.full_box_outline = _newSquare(false, Color3.fromRGB(0,0,0), 3)
+
+    -- Corner box: 8 линий + 8 outline линий
+    d.corner_box = {}
+    for i = 1, 8  do d.corner_box[i] = _newLine(Color3.fromRGB(0,0,0), 3)   end  -- outline
+    for i = 9, 16 do d.corner_box[i] = _newLine(Color3.fromRGB(255,255,255), 1) end  -- inner
+
+    -- Health bar: bg (square filled) + fill (square filled) + outline
+    d.hbar_bg      = _newSquare(true,  Color3.fromRGB(0,0,0),   1)
+    d.hbar_fill    = _newSquare(true,  Color3.fromRGB(0,255,0), 1)
+    d.hbar_outline = _newSquare(false, Color3.fromRGB(0,0,0),   1)
+    return d
+end
+
+local function _espHide(d)
+    if not d then return end
+    d.name.Visible=false; d.distance.Visible=false; d.weapon.Visible=false
+    d.full_box.Visible=false; d.full_box_outline.Visible=false
+    d.hbar_bg.Visible=false; d.hbar_fill.Visible=false; d.hbar_outline.Visible=false
+    for _, l in ipairs(d.corner_box) do l.Visible=false end
+end
+
+local function _espCleanDrawings(d)
+    if not d then return end
+    local function sr(o) pcall(function() o:Remove() end) end
+    sr(d.name); sr(d.distance); sr(d.weapon)
+    sr(d.full_box); sr(d.full_box_outline)
+    sr(d.hbar_bg); sr(d.hbar_fill); sr(d.hbar_outline)
+    for _, l in ipairs(d.corner_box) do sr(l) end
+end
+
+local _espPools = {}  -- [player] = drawing table
+
+-- ═══════════════════════════════════════════════════════════════
+-- BOUNDING BOX
+-- ═══════════════════════════════════════════════════════════════
+local BODY_PARTS = {"Head","HumanoidRootPart","Left Arm","Left Leg","Right Arm","Right Leg","Torso"}
+
+local function _getBounds(char, cam, insetY)
+    local minX, minY =  math.huge,  math.huge
+    local maxX, maxY = -math.huge, -math.huge
+    local anyOn = false
+
+    for _, name in ipairs(BODY_PARTS) do
+        local part = char:FindFirstChild(name)
+        if not part or not part:IsA("BasePart") then continue end
+        local cf, sz = part.CFrame, part.Size
+        local hx, hy, hz = sz.X/2, sz.Y/2, sz.Z/2
+        for sx = -1, 1, 2 do
+            for sy = -1, 1, 2 do
+                for sz2 = -1, 1, 2 do
+                    local corner = (cf * CFrame.new(hx*sx, hy*sy, hz*sz2)).Position
+                    local s = cam:WorldToViewportPoint(corner)
+                    if s.Z > 0 then
+                        anyOn = true
+                        -- MOBILE FIX: добавляем insetY чтобы компенсировать топбар
+                        local sy_fixed = s.Y + insetY
+                        if s.X  < minX then minX = s.X        end
+                        if sy_fixed < minY then minY = sy_fixed end
+                        if s.X  > maxX then maxX = s.X        end
+                        if sy_fixed > maxY then maxY = sy_fixed end
+                    end
+                end
+            end
         end
     end
-    local d = {}
-    d.name        = _newText(Color3.fromRGB(255,255,255), 13)
-    d.distance    = _newText(Color3.fromRGB(255,255,255), 13)
-    d.weapon      = _newText(Color3.fromRGB(255,0,0), 12)
-    d.full_box    = _newQuad(false, Color3.fromRGB(255,255,255), 1.5)
-    d.box_outline = _newQuad(false, Color3.fromRGB(0,0,0), 3)
-    d.healthbar_b = _newQuad(true, Color3.fromRGB(0,0,0))
-    d.healthbar_f = _newQuad(true, Color3.fromRGB(0,255,0))
-    d.corner_box = {}
-    for i = 1, 8  do d.corner_box[i] = _newLine(Color3.fromRGB(0,0,0), 3) end
-    for i = 9, 16 do d.corner_box[i] = _newLine(Color3.fromRGB(255,255,255), 1.5) end
-    _espDrawings[player] = d
+
+    return anyOn, minX, minY, maxX, maxY
 end
 
-local function _espHide(player)
-    local d = _espDrawings[player]; if not d then return end
-    d.name.Visible=false; d.distance.Visible=false; d.weapon.Visible=false
-    d.full_box.Visible=false; d.box_outline.Visible=false
-    d.healthbar_b.Visible=false; d.healthbar_f.Visible=false
-    for _, l in pairs(d.corner_box) do l.Visible = false end
+-- ═══════════════════════════════════════════════════════════════
+-- DRAW HELPERS (Square-based)
+-- ═══════════════════════════════════════════════════════════════
+local V2 = Vector2.new
+
+local function _drawFullBox(d, x0, y0, x1, y1, color, outlineOn)
+    local w, h = x1-x0, y1-y0
+    if outlineOn then
+        local ob = d.full_box_outline
+        ob.Position = V2(x0-1, y0-1); ob.Size = V2(w+2, h+2)
+        ob.Color = Color3.fromRGB(0,0,0); ob.Thickness = 3
+        ob.Filled = false; ob.Visible = true
+    else d.full_box_outline.Visible = false end
+
+    local fb = d.full_box
+    fb.Position = V2(x0, y0); fb.Size = V2(w, h)
+    fb.Color = color; fb.Thickness = 1
+    fb.Filled = false; fb.Visible = true
+
+    for _, l in ipairs(d.corner_box) do l.Visible = false end
 end
 
-local function _espClean(player)
-    local d = _espDrawings[player]; if not d then return end
-    for _, v in pairs(d) do
-        if type(v) == "table" then for _, l in pairs(v) do pcall(function() l:Remove() end) end
-        else pcall(function() v:Remove() end) end
+local function _drawCornerBox(d, x0, y0, x1, y1, color, outlineOn)
+    d.full_box.Visible = false; d.full_box_outline.Visible = false
+    local w, h = x1-x0, y1-y0
+    local len = math.clamp(math.min(w,h)*0.25, 3, 14)
+    local cb  = d.corner_box
+
+    -- сегменты: [From, To, isHorizontal]
+    local segs = {
+        {V2(x0,y0),       V2(x0+len, y0),   true},   -- TL horiz
+        {V2(x0,y0),       V2(x0, y0+len),   false},  -- TL vert
+        {V2(x1,y0),       V2(x1-len, y0),   true},   -- TR horiz
+        {V2(x1,y0),       V2(x1, y0+len),   false},  -- TR vert
+        {V2(x0,y1),       V2(x0+len, y1),   true},   -- BL horiz
+        {V2(x0,y1),       V2(x0, y1-len),   false},  -- BL vert
+        {V2(x1,y1),       V2(x1-len, y1),   true},   -- BR horiz
+        {V2(x1,y1),       V2(x1, y1-len),   false},  -- BR vert
+    }
+
+    for i = 1, 8 do
+        local seg = segs[i]
+        local isH = seg[3]
+        -- outline линия
+        local ol = cb[i]
+        if outlineOn then
+            if isH then
+                ol.From = V2(seg[1].X, seg[1].Y-1); ol.To = V2(seg[2].X, seg[2].Y-1)
+            else
+                ol.From = V2(seg[1].X-1, seg[1].Y); ol.To = V2(seg[2].X-1, seg[2].Y)
+            end
+            ol.Color = Color3.fromRGB(0,0,0); ol.Thickness = 3; ol.Visible = true
+        else ol.Visible = false end
+        -- inner линия
+        local il = cb[i+8]
+        il.From = seg[1]; il.To = seg[2]
+        il.Color = color; il.Thickness = 1; il.Visible = true
     end
-    _espDrawings[player] = nil
+end
+
+local function _drawHealthBar(d, x0, y0, x1, y1, hum, bw, outlineOn)
+    local pct = hum.MaxHealth > 0 and math.clamp(hum.Health/hum.MaxHealth,0,1) or 0
+    local h   = y1 - y0
+    local fh  = h * pct
+    local x   = x0 - (bw + 3)
+    local r   = math.clamp(1-pct,0,1); local g = math.clamp(pct,0,1)
+
+    local bg = d.hbar_bg
+    bg.Position = V2(x, y0); bg.Size = V2(bw, h)
+    bg.Color = Color3.fromRGB(0,0,0); bg.Filled = true; bg.Visible = true
+
+    local fi = d.hbar_fill
+    fi.Position = V2(x, y0 + (h-fh)); fi.Size = V2(bw, math.max(fh,1))
+    fi.Color = Color3.new(r,g,0); fi.Filled = true; fi.Visible = true
+
+    local ol = d.hbar_outline
+    if outlineOn then
+        ol.Position = V2(x-1, y0-1); ol.Size = V2(bw+2, h+2)
+        ol.Color = Color3.fromRGB(0,0,0); ol.Filled = false; ol.Thickness = 1; ol.Visible = true
+    else ol.Visible = false end
 end
 
 -- ═══════════════════════════════════════════════════════════════
--- RENDER LOOP — использует framework.players как второй пример
+-- RENDER LOOP
 -- ═══════════════════════════════════════════════════════════════
-game:GetService("RunService").Heartbeat:Connect(function()
+RunService.Heartbeat:Connect(function()
     pcall(function()
+        local insetY = _insetTop   -- GUI inset для мобилы
+
         if not esp.settings.enabled then
-            for player in pairs(_espDrawings) do _espHide(player) end
+            for _, d in pairs(_espPools) do _espHide(d) end
             return
         end
 
-        local cam = workspace.CurrentCamera
-        local lp  = esp.localPlayer
+        local cam       = workspace.CurrentCamera
+        local lp        = esp.localPlayer
         local localChar = framework.character
         local localRoot = localChar and localChar:FindFirstChild("HumanoidRootPart")
 
         if not localRoot then
-            for player in pairs(_espDrawings) do _espHide(player) end
+            for _, d in pairs(_espPools) do _espHide(d) end
             return
         end
 
-        -- ── инициализируем пулы для игроков из framework.players ──
+        -- инициализируем пулы для новых игроков
         for player, _ in pairs(framework.players) do
-            if player ~= lp and not _espDrawings[player] then
-                _espInit(player)
+            if player ~= lp and not _espPools[player] then
+                _espPools[player] = _espInit(player)
             end
         end
 
-        -- ── рендерим по framework.players ──
         for player, data in pairs(framework.players) do
             if player == lp then continue end
 
-            if not _espDrawings[player] then _espInit(player) end
-            local d = _espDrawings[player]
+            local d = _espPools[player]
+            if not d then d = _espInit(player); _espPools[player] = d end
 
-            -- используем data.spawned / data.character / data.root из framework
             if not data.spawned or not data.character or not data.root then
-                _espHide(player); continue
+                _espHide(d); continue
             end
 
-            if esp.settings.teamcheck and player.Team == lp.Team then _espHide(player); continue end
+            if esp.settings.teamcheck and player.Team == lp.Team then _espHide(d); continue end
 
             local char = data.character
             local root = data.root
             local hum  = char:FindFirstChildOfClass("Humanoid")
-            if not hum or hum.Health <= 0 then _espHide(player); continue end
+            if not hum or hum.Health <= 0 then _espHide(d); continue end
 
             local dist = (root.Position - localRoot.Position).Magnitude / 3
-            if esp.settings.maxdis == 0 or dist > esp.settings.maxdis then _espHide(player); continue end
+            if esp.settings.maxdis == 0 or dist > esp.settings.maxdis then _espHide(d); continue end
 
             if not _espWeaponConns[player] then _espHookWeaponCache(player) end
 
-            local minX, minY =  math.huge,  math.huge
-            local maxX, maxY = -math.huge, -math.huge
-            local onscreen = false
+            local anyOn, x0, y0, x1, y1 = _getBounds(char, cam, insetY)
+            if not anyOn then _espHide(d); continue end
 
-            local hSP, hON = cam:WorldToViewportPoint(char:FindFirstChild("Head") and
-                (char.Head.Position + Vector3.new(0, char.Head.Size.Y * 0.5, 0)) or root.Position)
-            if hON and hSP.Z > 0 then
-                onscreen = true; minY = hSP.Y
-                minX = math.min(minX, hSP.X); maxX = math.max(maxX, hSP.X)
-            end
-            for _, n in ipairs({"Right Arm", "Left Arm"}) do
-                local p = char:FindFirstChild(n)
-                if p then
-                    local s, on = cam:WorldToViewportPoint(p.Position)
-                    if on and s.Z > 0 then
-                        local sx = cam:WorldToViewportPoint(p.Position + Vector3.new(0.5,0,0))
-                        local pad = math.abs(sx.X - s.X)
-                        minX = math.min(minX, s.X - pad); maxX = math.max(maxX, s.X + pad); onscreen = true
-                    end
-                end
-            end
-            for _, n in ipairs({"Right Leg", "Left Leg"}) do
-                local p = char:FindFirstChild(n)
-                if p then
-                    local s, on = cam:WorldToViewportPoint(p.Position - Vector3.new(0, p.Size.Y * 0.5, 0))
-                    if on and s.Z > 0 then maxY = math.max(maxY, s.Y); onscreen = true end
-                end
-            end
+            local w, h = x1-x0, y1-y0
+            if h <= 1 then _espHide(d); continue end
 
-            if not onscreen or minX==math.huge or maxX==-math.huge or minY==math.huge or maxY==-math.huge then
-                _espHide(player); continue
-            end
+            x0 = math.floor(x0); y0 = math.floor(y0)
+            x1 = math.floor(x1); y1 = math.floor(y1)
+            local cx = math.floor((x0+x1)*0.5)
 
-            local tl = Vector2.new(math.floor(minX), math.floor(minY))
-            local br = Vector2.new(math.floor(maxX), math.floor(maxY))
-            local tr = Vector2.new(br.X, tl.Y)
-            local bl = Vector2.new(tl.X, br.Y)
-            local cx = math.floor((tl.X + br.X) * 0.5)
-            local bh = br.Y - tl.Y
-            if bh <= 1 then _espHide(player); continue end
-
-            if esp.settings.name.enabled then
-                local dn = d.name
-                dn.Text = player.Name; dn.Color = esp.settings.name.color
-                dn.Outline = esp.settings.name.outline; dn.Size = esp.settings.name.size
-                dn.Position = Vector2.new(cx, tl.Y - dn.TextBounds.Y - 4); dn.Visible = true
-            else d.name.Visible = false end
-
-            if esp.settings.distance.enabled then
-                local dd = d.distance
-                dd.Text = tostring(math.round(dist)) .. "m"
-                dd.Color = esp.settings.distance.color; dd.Outline = esp.settings.distance.outline
-                dd.Size = esp.settings.distance.size
-                local tb = dd.TextBounds
-                dd.Position = dist >= 150
-                    and Vector2.new(br.X + tb.X*0.5+4, (tl.Y+br.Y)*0.5 - tb.Y*0.5)
-                    or  Vector2.new(br.X + tb.X*0.5+6, tl.Y)
-                dd.Visible = true
-            else d.distance.Visible = false end
-
-            if esp.settings.weapon.enabled then
-                local dw = d.weapon
-                dw.Text = esp:getPlayerWeapon(player); dw.Color = esp.settings.weapon.color
-                dw.Outline = esp.settings.weapon.outline; dw.Size = esp.settings.weapon.size
-                dw.Position = Vector2.new(cx, br.Y + bh*0.005); dw.Visible = true
-            else d.weapon.Visible = false end
-
-            if esp.settings.healthbar.enabled then
-                local bw = esp.settings.healthbar.width; local xo = 3
-                local pct = hum.MaxHealth > 0 and math.clamp(hum.Health/hum.MaxHealth,0,1) or 0
-                local fh = bh * pct
-                local hbb = d.healthbar_b
-                hbb.PointA=Vector2.new(tl.X-xo-bw,tl.Y-1); hbb.PointB=Vector2.new(tl.X-xo,tl.Y-1)
-                hbb.PointC=Vector2.new(tl.X-xo,br.Y+2);    hbb.PointD=Vector2.new(tl.X-xo-bw,br.Y+2)
-                hbb.Color=Color3.fromRGB(0,0,0); hbb.Visible=esp.settings.healthbar.outline
-                local hbf = d.healthbar_f
-                hbf.PointA=Vector2.new(tl.X-xo-bw+1,br.Y-fh); hbf.PointB=Vector2.new(tl.X-xo-1,br.Y-fh)
-                hbf.PointC=Vector2.new(tl.X-xo-1,br.Y+1);     hbf.PointD=Vector2.new(tl.X-xo-bw+1,br.Y+1)
-                hbf.Color=Color3.new(math.clamp(1-pct,0,1),math.clamp(pct,0,1),0); hbf.Visible=true
-            else d.healthbar_b.Visible=false; d.healthbar_f.Visible=false end
-
+            -- BOX
             if esp.settings.box.enabled then
                 if esp.settings.box.mode == "full" then
-                    for _, l in pairs(d.corner_box) do l.Visible = false end
-                    local fb = d.full_box
-                    fb.PointA=tl; fb.PointB=tr; fb.PointC=br; fb.PointD=bl
-                    fb.Color=esp.settings.box.color; fb.Thickness=1.5; fb.Visible=true
-                    if esp.settings.box.outline then
-                        local ob=d.box_outline
-                        ob.PointA=tl; ob.PointB=tr; ob.PointC=br; ob.PointD=bl
-                        ob.Color=Color3.fromRGB(0,0,0); ob.Thickness=3; ob.Visible=true
-                    else d.box_outline.Visible=false end
+                    _drawFullBox(d, x0, y0, x1, y1, esp.settings.box.color, esp.settings.box.outline)
                 else
-                    d.full_box.Visible=false; d.box_outline.Visible=false
-                    local cb=d.corner_box
-                    local ls=math.max(math.min((br.X-tl.X)*0.25,bh*0.25),3)
-                    cb[9].From=tl;               cb[9].To=tl+Vector2.new(ls,0)
-                    cb[10].From=tl;              cb[10].To=tl+Vector2.new(0,ls)
-                    cb[11].From=tr;              cb[11].To=tr-Vector2.new(ls,0)
-                    cb[12].From=tr;              cb[12].To=tr+Vector2.new(0,ls)
-                    cb[13].From=bl;              cb[13].To=bl+Vector2.new(ls,0)
-                    cb[14].From=bl;              cb[14].To=bl-Vector2.new(0,ls)
-                    cb[15].From=br+Vector2.new(1,0); cb[15].To=br-Vector2.new(ls,0)
-                    cb[16].From=br+Vector2.new(0,1); cb[16].To=br-Vector2.new(0,ls)
-                    for i=9,16 do cb[i].Color=esp.settings.box.color; cb[i].Visible=true end
-                    if esp.settings.box.outline then
-                        local ot=3
-                        cb[1].From=tl-Vector2.new(1,0);  cb[1].To=tl+Vector2.new(ls+1,0); cb[1].Thickness=ot
-                        cb[2].From=tl-Vector2.new(0,1);  cb[2].To=tl+Vector2.new(0,ls+1); cb[2].Thickness=ot
-                        cb[3].From=tr+Vector2.new(1,0);  cb[3].To=tr-Vector2.new(ls+1,0); cb[3].Thickness=ot
-                        cb[4].From=tr-Vector2.new(0,1);  cb[4].To=tr+Vector2.new(0,ls+1); cb[4].Thickness=ot
-                        cb[5].From=bl-Vector2.new(1,0);  cb[5].To=bl+Vector2.new(ls+1,0); cb[5].Thickness=ot
-                        cb[6].From=bl-Vector2.new(0,1);  cb[6].To=bl-Vector2.new(0,ls+1); cb[6].Thickness=ot
-                        cb[7].From=br+Vector2.new(2,0);  cb[7].To=br-Vector2.new(ls+1,0); cb[7].Thickness=ot
-                        cb[8].From=br+Vector2.new(0,2);  cb[8].To=br-Vector2.new(0,ls+1); cb[8].Thickness=ot
-                    end
-                    for i=1,8 do cb[i].Visible=esp.settings.box.outline end
+                    _drawCornerBox(d, x0, y0, x1, y1, esp.settings.box.color, esp.settings.box.outline)
                 end
             else
-                d.full_box.Visible=false; d.box_outline.Visible=false
-                for _,l in pairs(d.corner_box) do l.Visible=false end
+                d.full_box.Visible=false; d.full_box_outline.Visible=false
+                for _, l in ipairs(d.corner_box) do l.Visible=false end
             end
+
+            -- HEALTH BAR
+            if esp.settings.healthbar.enabled then
+                _drawHealthBar(d, x0, y0, x1, y1, hum, esp.settings.healthbar.width, esp.settings.healthbar.outline)
+            else
+                d.hbar_bg.Visible=false; d.hbar_fill.Visible=false; d.hbar_outline.Visible=false
+            end
+
+            -- NAME (над боксом)
+            if esp.settings.name.enabled then
+                local t = d.name
+                t.Text    = player.Name
+                t.Size    = esp.settings.name.size
+                t.Color   = esp.settings.name.color
+                t.Outline = esp.settings.name.outline
+                t.Position = V2(cx, y0 - esp.settings.name.size - 2)
+                t.Visible = true
+            else d.name.Visible = false end
+
+            -- DISTANCE (справа от бокса)
+            if esp.settings.distance.enabled then
+                local t = d.distance
+                t.Text    = math.round(dist) .. "m"
+                t.Size    = esp.settings.distance.size
+                t.Color   = esp.settings.distance.color
+                t.Outline = esp.settings.distance.outline
+                t.Position = V2(x1 + 4, y0)
+                t.Visible = true
+            else d.distance.Visible = false end
+
+            -- WEAPON (под боксом)
+            if esp.settings.weapon.enabled then
+                local t = d.weapon
+                t.Text    = esp:getPlayerWeapon(player)
+                t.Size    = esp.settings.weapon.size
+                t.Color   = esp.settings.weapon.color
+                t.Outline = esp.settings.weapon.outline
+                t.Position = V2(cx, y1 + 2)
+                t.Visible = true
+            else d.weapon.Visible = false end
         end
 
-        -- ── чистим пулы ушедших игроков ──
-        for player in pairs(_espDrawings) do
+        -- чистим ушедших игроков
+        for player, d in pairs(_espPools) do
             if not framework.players[player] then
-                _espClean(player)
+                _espCleanDrawings(d); _espPools[player] = nil
             end
         end
     end)
 end)
 
--- playeradded/removing через framework
+-- playeradded/removing
 table.insert(framework.connec_funcs["playeradded"], function(player)
-    task.wait(0.5); _espInit(player); _espHookWeaponCache(player)
+    task.wait(0.5)
+    if player ~= esp.localPlayer then
+        _espPools[player] = _espInit(player)
+        _espHookWeaponCache(player)
+    end
 end)
 table.insert(framework.connec_funcs["playerremoving"], function(player)
-    _espClean(player); _espWeaponCache[player] = nil
+    if _espPools[player] then _espCleanDrawings(_espPools[player]); _espPools[player] = nil end
+    _espWeaponCache[player] = nil
     if _espWeaponConns[player] then
         for _, c in pairs(_espWeaponConns[player]) do pcall(function() c:Disconnect() end) end
         _espWeaponConns[player] = nil
     end
 end)
 
--- инициализация уже существующих игроков
+-- инит для уже существующих игроков
 for _, p in pairs(game:GetService("Players"):GetPlayers()) do
-    if p ~= esp.localPlayer then _espInit(p) end
+    if p ~= esp.localPlayer then _espPools[p] = _espInit(p) end
 end
 
 -- ═══════════════════════════════════════════════════════════════
 -- UI
 -- ═══════════════════════════════════════════════════════════════
-local EspMainGroup   = Tabs.Visuals:AddLeftGroupbox("ESP", "eye", {Collapsible=true})
-local EspBoxGroup    = Tabs.Visuals:AddRightGroupbox("Box", "square", {Collapsible=true})
+local EspMainGroup = Tabs.Visuals:AddLeftGroupbox("ESP", "eye", {Collapsible=true})
+local EspBoxGroup  = Tabs.Visuals:AddRightGroupbox("Box", "square", {Collapsible=true})
 
 EspMainGroup:AddToggle("EnableESP",{Text="Enable ESP",Default=false,
     Callback=function(v)
@@ -364,7 +470,7 @@ local WeaponToggle=EspMainGroup:AddToggle("WeaponEnabled",{Text="Weapon",Default
 WeaponToggle:AddColorPicker("WeaponColor",{Default=Color3.fromRGB(255,0,0),Title="Weapon Color",
     Callback=function(v) esp.settings.weapon.color=v end})
 
-local HpToggle=EspMainGroup:AddToggle("HealthbarEnabled",{Text="Health bar",Default=false,
+EspMainGroup:AddToggle("HealthbarEnabled",{Text="Health bar",Default=false,
     Callback=function(v) esp.settings.healthbar.enabled=v end})
 EspMainGroup:AddToggle("HealthbarOutline",{Text="Outline",Default=false,
     Callback=function(v) esp.settings.healthbar.outline=v end})
@@ -397,13 +503,9 @@ local function _chamsGetColors(player)
     local occCol = _chamsOccludedColor
     if _teamChamsOn then
         local tm = player.Team
-        if tm == criminalsTeam then
-            visCol = _chamsCriminals; occCol = _chamsCriminals
-        elseif tm == guardsTeam then
-            visCol = _chamsGuards; occCol = _chamsGuards
-        elseif tm == inmatesTeam then
-            visCol = _chamsInmates; occCol = _chamsInmates
-        end
+        if tm == criminalsTeam then visCol = _chamsCriminals; occCol = _chamsCriminals
+        elseif tm == guardsTeam then visCol = _chamsGuards; occCol = _chamsGuards
+        elseif tm == inmatesTeam then visCol = _chamsInmates; occCol = _chamsInmates end
     end
     return visCol, occCol
 end
@@ -415,34 +517,20 @@ end
 
 local function _chamsAddHighlight(char, visibleColor, occludedColor)
     if char:FindFirstChild("ChamsHighlight_Visible") then return end
-
     local hOcc = Instance.new("Highlight")
-    hOcc.Name = "ChamsHighlight_Occluded"
-    hOcc.FillColor = occludedColor
-    hOcc.OutlineColor = _chamsOutlineColor
-    hOcc.FillTransparency = _chamsFillTransparency
-    hOcc.OutlineTransparency = _chamsOutlineTransparency
-    hOcc.DepthMode = Enum.HighlightDepthMode.Occluded
-    hOcc.Adornee = char
-    hOcc.Parent = char
-
+    hOcc.Name="ChamsHighlight_Occluded"; hOcc.FillColor=occludedColor; hOcc.OutlineColor=_chamsOutlineColor
+    hOcc.FillTransparency=_chamsFillTransparency; hOcc.OutlineTransparency=_chamsOutlineTransparency
+    hOcc.DepthMode=Enum.HighlightDepthMode.Occluded; hOcc.Adornee=char; hOcc.Parent=char
     local hVis = Instance.new("Highlight")
-    hVis.Name = "ChamsHighlight_Visible"
-    hVis.FillColor = visibleColor
-    hVis.OutlineColor = _chamsOutlineColor
-    hVis.FillTransparency = _chamsFillTransparency
-    hVis.OutlineTransparency = _chamsOutlineTransparency
-    hVis.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-    hVis.Adornee = char
-    hVis.Parent = char
+    hVis.Name="ChamsHighlight_Visible"; hVis.FillColor=visibleColor; hVis.OutlineColor=_chamsOutlineColor
+    hVis.FillTransparency=_chamsFillTransparency; hVis.OutlineTransparency=_chamsOutlineTransparency
+    hVis.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop; hVis.Adornee=char; hVis.Parent=char
 end
 
 local function _chamsRemoveHighlight(char)
     if not char then return end
-    local hVis = char:FindFirstChild("ChamsHighlight_Visible")
-    if hVis then hVis:Destroy() end
-    local hOcc = char:FindFirstChild("ChamsHighlight_Occluded")
-    if hOcc then hOcc:Destroy() end
+    local h = char:FindFirstChild("ChamsHighlight_Visible"); if h then h:Destroy() end
+    local h2 = char:FindFirstChild("ChamsHighlight_Occluded"); if h2 then h2:Destroy() end
 end
 
 local function _chamsCleanAll()
@@ -479,27 +567,22 @@ game.Players.PlayerRemoving:Connect(function(plr)
     if _chamsCharConns[plr] then _chamsCharConns[plr]:Disconnect(); _chamsCharConns[plr] = nil end
 end)
 
-game:GetService("RunService").Heartbeat:Connect(function()
+RunService.Heartbeat:Connect(function()
     pcall(function()
         local lp = game.Players.LocalPlayer
-        local localChar = lp.Character
-        local localRoot = localChar and localChar:FindFirstChild("HumanoidRootPart")
-        for player, _ in pairs(framework.players) do
+        for player, data in pairs(framework.players) do
             if player == lp then continue end
-            local data = framework.players[player]
             local char = data.character; if not char then continue end
             local hum = char:FindFirstChildOfClass("Humanoid")
             if hum and hum.Health <= 0 then _chamsRemoveHighlight(char); continue end
-
             local withinRange = false
-            if _chamsEnabled and localRoot then
-                local root = data.root
-                if root then
-                    local dist = (root.Position - localRoot.Position).Magnitude / 3
+            if _chamsEnabled and framework.character then
+                local localRoot = framework.character:FindFirstChild("HumanoidRootPart")
+                if localRoot and data.root then
+                    local dist = (data.root.Position - localRoot.Position).Magnitude / 3
                     if esp.settings.maxdis > 0 and dist <= esp.settings.maxdis then withinRange = true end
                 end
             end
-
             if not _chamsEnabled or _chamsSkip(player) or not withinRange then
                 _chamsRemoveHighlight(char)
             else
@@ -509,14 +592,14 @@ game:GetService("RunService").Heartbeat:Connect(function()
                 if not hVis or not hOcc then
                     _chamsAddHighlight(char, visCol, occCol)
                 else
-                    if hVis.FillColor ~= visCol then hVis.FillColor = visCol end
-                    if hVis.OutlineColor ~= _chamsOutlineColor then hVis.OutlineColor = _chamsOutlineColor end
-                    if hVis.FillTransparency ~= _chamsFillTransparency then hVis.FillTransparency = _chamsFillTransparency end
-                    if hVis.OutlineTransparency ~= _chamsOutlineTransparency then hVis.OutlineTransparency = _chamsOutlineTransparency end
-                    if hOcc.FillColor ~= occCol then hOcc.FillColor = occCol end
-                    if hOcc.OutlineColor ~= _chamsOutlineColor then hOcc.OutlineColor = _chamsOutlineColor end
-                    if hOcc.FillTransparency ~= _chamsFillTransparency then hOcc.FillTransparency = _chamsFillTransparency end
-                    if hOcc.OutlineTransparency ~= _chamsOutlineTransparency then hOcc.OutlineTransparency = _chamsOutlineTransparency end
+                    if hVis.FillColor~=visCol then hVis.FillColor=visCol end
+                    if hVis.OutlineColor~=_chamsOutlineColor then hVis.OutlineColor=_chamsOutlineColor end
+                    if hVis.FillTransparency~=_chamsFillTransparency then hVis.FillTransparency=_chamsFillTransparency end
+                    if hVis.OutlineTransparency~=_chamsOutlineTransparency then hVis.OutlineTransparency=_chamsOutlineTransparency end
+                    if hOcc.FillColor~=occCol then hOcc.FillColor=occCol end
+                    if hOcc.OutlineColor~=_chamsOutlineColor then hOcc.OutlineColor=_chamsOutlineColor end
+                    if hOcc.FillTransparency~=_chamsFillTransparency then hOcc.FillTransparency=_chamsFillTransparency end
+                    if hOcc.OutlineTransparency~=_chamsOutlineTransparency then hOcc.OutlineTransparency=_chamsOutlineTransparency end
                 end
             end
         end
@@ -526,17 +609,14 @@ end)
 local ChamsGroup = Tabs.Visuals:AddLeftGroupbox("Chams", "layers", {Collapsible=true})
 ChamsGroup:AddToggle("ChamsEnabled",{Text="Enable Chams",Default=false,
     Callback=function(v) _chamsEnabled=v; if not v then _chamsCleanAll() end end})
-
 ChamsGroup:AddLabel("Visible Color"):AddColorPicker("ChamsVisibleColor",{Default=Color3.fromRGB(0,200,255),Title="Visible Color",
     Callback=function(v) _chamsVisibleColor=v end})
 ChamsGroup:AddLabel("Occluded Color"):AddColorPicker("ChamsOccludedColor",{Default=Color3.fromRGB(255,40,40),Title="Occluded Color",
     Callback=function(v) _chamsOccludedColor=v end})
-
 ChamsGroup:AddSlider("FillTransparency",{Text="Fill Transparency",Default=0.5,Min=0,Max=1,Rounding=2,
     Callback=function(v) _chamsFillTransparency=v end})
 ChamsGroup:AddSlider("OutlineTransparency",{Text="Outline Transparency",Default=1,Min=0,Max=1,Rounding=2,
     Callback=function(v) _chamsOutlineTransparency=v end})
-
 ChamsGroup:AddDivider()
 ChamsGroup:AddToggle("TeamChamsEnabled",{Text="Team Chams",Default=false,
     Callback=function(v) _teamChamsOn=v end})
