@@ -1,4 +1,4 @@
--- ps7
+-- ps
 local Tabs         = _G.ZoltTabs
 local Library      = _G.ZoltLibrary
 local Options      = _G.ZoltOptions
@@ -211,18 +211,26 @@ local function _getBounds(char, cam)
     local minX, minY =  math.huge,  math.huge
     local maxX, maxY = -math.huge, -math.huge
     local anyOn = false
+
     for _, name in ipairs(BODY_PARTS) do
         local part = char:FindFirstChild(name)
         if not part or not part:IsA("BasePart") then continue end
         local cf, sz = part.CFrame, part.Size
         local hx, hy, hz = sz.X/2, sz.Y/2, sz.Z/2
         for sx = -1, 1, 2 do for sy = -1, 1, 2 do for sz2 = -1, 1, 2 do
-            local s, _, on = cam:WorldToViewportPoint((cf * CFrame.new(hx*sx, hy*sy, hz*sz2)).Position)
-            if on then anyOn = true end
-            if s.X < minX then minX = s.X end; if s.Y < minY then minY = s.Y end
-            if s.X > maxX then maxX = s.X end; if s.Y > maxY then maxY = s.Y end
+            local corner = (cf * CFrame.new(hx*sx, hy*sy, hz*sz2)).Position
+            local s = cam:WorldToViewportPoint(corner)
+            -- s это Vector3: X,Y = экран, Z = глубина (>0 = перед камерой)
+            if s.Z > 0 then
+                anyOn = true
+                if s.X < minX then minX = s.X end
+                if s.Y < minY then minY = s.Y end
+                if s.X > maxX then maxX = s.X end
+                if s.Y > maxY then maxY = s.Y end
+            end
         end end end
     end
+
     return anyOn, minX, minY, maxX, maxY
 end
 
@@ -230,98 +238,106 @@ end
 -- RENDER LOOP — читаем framework.players, как chams
 -- ═══════════════════════════════════════════════════════════════
 RunService.Heartbeat:Connect(function(dt)
-    local cam = workspace.CurrentCamera
-    local lp = framework.player
-    local localRoot = framework.character and framework.character:FindFirstChild("HumanoidRootPart")
+    pcall(function()
+        local cam       = framework.services.camera
+        local lp        = framework.player
+        local localRoot = framework.character and framework.character:FindFirstChild("HumanoidRootPart")
 
-    if not esp.settings.enabled then
-        for _, pool in pairs(_espPools) do _hidePool(pool) end
-        return
-    end
-
-    for player, data in pairs(framework.players) do
-        if player == lp then continue end
-
-        if not _espPools[player] then
-            _espPools[player] = _createPool()
-            warn("ESP: created pool for", player.Name)
+        if not esp.settings.enabled then
+            for _, pool in pairs(_espPools) do _hidePool(pool) end
+            return
         end
-        local pool = _espPools[player]
 
-        if not data.spawned then warn("ESP skip: not spawned", player.Name); _hidePool(pool); continue end
-        if not data.character then warn("ESP skip: no character", player.Name); _hidePool(pool); continue end
-        if not data.root then warn("ESP skip: no root", player.Name); _hidePool(pool); continue end
+        for player, data in pairs(framework.players) do
+            if player == lp then continue end
 
-        local char = data.character
-        local root = data.root
-        local hum = char:FindFirstChildOfClass("Humanoid")
-        if not hum then warn("ESP skip: no hum", player.Name); _hidePool(pool); continue end
-        if hum.Health <= 0 then warn("ESP skip: dead", player.Name); _hidePool(pool); continue end
-
-        if esp.settings.teamcheck and player.Team == lp.Team then _hidePool(pool); continue end
-
-        if not localRoot then warn("ESP skip: no localRoot"); _hidePool(pool); continue end
-        local dist = (root.Position - localRoot.Position).Magnitude / 3
-        if esp.settings.maxdis == 0 or dist > esp.settings.maxdis then warn("ESP skip: dist", dist, esp.settings.maxdis); _hidePool(pool); continue end
-
-        local anyOn, x0, y0, x1, y1 = _getBounds(char, cam)
-        warn("ESP bounds:", player.Name, anyOn, x0, y0, x1, y1)
-
-        if not anyOn then _hidePool(pool); continue end
-        local w, h = x1-x0, y1-y0
-        if h <= 1 then warn("ESP skip: h<=1", h); _hidePool(pool); continue end
-
-        local cx = math.floor((x0+x1)*0.5)
-        local outlineOn = esp.settings.box.outline
-        local boxColor = esp.settings.box.color
-
-        if esp.settings.box.enabled then
-            if esp.settings.box.mode == "full" then
-                _drawFullBox(pool, x0, y0, x1, y1, boxColor, outlineOn)
-            else
-                _drawCornerBox(pool, x0, y0, x1, y1, boxColor, outlineOn)
+            if not _espPools[player] then
+                _espPools[player] = _createPool()
             end
-            warn("ESP: drew box for", player.Name, esp.settings.box.mode)
+            local pool = _espPools[player]
+
+            if not data.spawned or not data.character or not data.root then
+                _hidePool(pool); continue
+            end
+
+            local char = data.character
+            local root = data.root
+            local hum  = char:FindFirstChildOfClass("Humanoid")
+            if not hum or hum.Health <= 0 then _hidePool(pool); continue end
+
+            if esp.settings.teamcheck and player.Team == lp.Team then _hidePool(pool); continue end
+
+            if not localRoot then _hidePool(pool); continue end
+            local dist = (root.Position - localRoot.Position).Magnitude / 3
+            if esp.settings.maxdis == 0 or dist > esp.settings.maxdis then _hidePool(pool); continue end
+
+            if not _espWeaponConns[player] then _espHookWeaponCache(player) end
+
+            local anyOn, x0, y0, x1, y1 = _getBounds(char, cam)
+            if not anyOn then _hidePool(pool); continue end
+
+            local w, h = x1-x0, y1-y0
+            if h <= 1 then _hidePool(pool); continue end
+
+            local cx        = math.floor((x0+x1)*0.5)
+            local outlineOn = esp.settings.box.outline
+            local boxColor  = esp.settings.box.color
+
+            if esp.settings.box.enabled then
+                if esp.settings.box.mode == "full" then
+                    _drawFullBox(pool, x0, y0, x1, y1, boxColor, outlineOn)
+                else
+                    _drawCornerBox(pool, x0, y0, x1, y1, boxColor, outlineOn)
+                end
+            else
+                pool.Box.Visible=false; pool.BoxOutline.Visible=false; pool.BoxInnerOutline.Visible=false
+                for i=1,8 do pool.Corners[i].Visible=false end
+                for i=1,16 do pool.CornerOutlines[i].Visible=false end
+            end
+
+            if esp.settings.healthbar.enabled then
+                local real = clamp(hum.Health / hum.MaxHealth, 0, 1)
+                pool.HealthRatio = pool.HealthRatio + (real - pool.HealthRatio) * clamp(dt*10, 0, 1)
+                if pool.HealthRatio ~= pool.HealthRatio then pool.HealthRatio = real end
+                _drawHealthBar(pool, x0, y0, x1, y1, pool.HealthRatio, esp.settings.healthbar.width, outlineOn)
+            else
+                pool.HealthFill.Visible=false; pool.HealthBg.Visible=false; pool.HealthOutline.Visible=false
+            end
+
+            local topY = y0 - 2
+            local botY = y1 + 2
+
+            if esp.settings.name.enabled then
+                local t = pool.Name
+                t.Text=player.Name; t.Size=esp.settings.name.size
+                t.Color=esp.settings.name.color; t.Outline=esp.settings.name.outline
+                t.Position=V2(cx, topY - esp.settings.name.size)
+                t.Visible=true
+                topY = topY - esp.settings.name.size - 1
+            else pool.Name.Visible=false end
+
+            if esp.settings.distance.enabled then
+                local t = pool.Distance
+                t.Text=math.round(dist).."m"; t.Size=esp.settings.distance.size
+                t.Color=esp.settings.distance.color; t.Outline=esp.settings.distance.outline
+                t.Position=V2(cx, botY); t.Visible=true
+                botY = botY + esp.settings.distance.size + 1
+            else pool.Distance.Visible=false end
+
+            if esp.settings.weapon.enabled then
+                local t = pool.Weapon
+                t.Text=esp:getPlayerWeapon(player); t.Size=esp.settings.weapon.size
+                t.Color=esp.settings.weapon.color; t.Outline=esp.settings.weapon.outline
+                t.Position=V2(cx, botY); t.Visible=true
+            else pool.Weapon.Visible=false end
         end
 
-        if esp.settings.healthbar.enabled then
-            local real = clamp(hum.Health / hum.MaxHealth, 0, 1)
-            pool.HealthRatio = pool.HealthRatio + (real - pool.HealthRatio) * clamp(dt*10, 0, 1)
-            _drawHealthBar(pool, x0, y0, x1, y1, pool.HealthRatio, esp.settings.healthbar.width, outlineOn)
-        else
-            pool.HealthFill.Visible=false; pool.HealthBg.Visible=false; pool.HealthOutline.Visible=false
+        for player, pool in pairs(_espPools) do
+            if not framework.players[player] then
+                _removePool(pool); _espPools[player] = nil
+            end
         end
-
-        local topY = y0 - 2
-        local botY = y1 + 2
-
-        if esp.settings.name.enabled then
-            pool.Name.Text=player.Name; pool.Name.Size=esp.settings.name.size
-            pool.Name.Color=esp.settings.name.color; pool.Name.Outline=esp.settings.name.outline
-            pool.Name.Position=V2(cx, topY - esp.settings.name.size)
-            pool.Name.Visible=true
-            warn("ESP: name drawn at", cx, topY - esp.settings.name.size)
-        else pool.Name.Visible=false end
-
-        if esp.settings.distance.enabled then
-            pool.Distance.Text=math.round(dist).."m"; pool.Distance.Size=esp.settings.distance.size
-            pool.Distance.Color=esp.settings.distance.color; pool.Distance.Outline=esp.settings.distance.outline
-            pool.Distance.Position=V2(cx, botY); pool.Distance.Visible=true
-            botY = botY + esp.settings.distance.size + 1
-        else pool.Distance.Visible=false end
-
-        if esp.settings.weapon.enabled then
-            pool.Weapon.Text=esp:getPlayerWeapon(player); pool.Weapon.Size=esp.settings.weapon.size
-            pool.Weapon.Color=esp.settings.weapon.color; pool.Weapon.Outline=esp.settings.weapon.outline
-            pool.Weapon.Position=V2(cx, botY); pool.Weapon.Visible=true
-        else pool.Weapon.Visible=false end
-    end
-
-    for player, pool in pairs(_espPools) do
-        if not framework.players[player] then
-            _removePool(pool); _espPools[player] = nil
-        end
-    end
+    end)
 end)
 
 -- ═══════════════════════════════════════════════════════════════
